@@ -38,6 +38,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 
 	"github.com/pkg/errors"
 )
@@ -151,34 +152,34 @@ func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}
 }
 
 func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp interface{}) error {
-	var requestBody bytes.Buffer
+	var requestBody, operationsBuf, mapBuf bytes.Buffer
 	writer := multipart.NewWriter(&requestBody)
-	if err := writer.WriteField("query", req.q); err != nil {
-		return errors.Wrap(err, "write query field")
+	if err := json.NewEncoder(&operationsBuf).Encode(req.Operations()); err != nil {
+		return errors.Wrap(err, "encode operations")
 	}
-	var variablesBuf bytes.Buffer
-	if len(req.vars) > 0 {
-		variablesField, err := writer.CreateFormField("variables")
-		if err != nil {
-			return errors.Wrap(err, "create variables field")
-		}
-		if err := json.NewEncoder(io.MultiWriter(variablesField, &variablesBuf)).Encode(req.vars); err != nil {
-			return errors.Wrap(err, "encode variables")
-		}
+	if err := writer.WriteField("operations", operationsBuf.String()); err != nil {
+		return errors.Wrap(err, "write operations field")
 	}
-	for i := range req.files {
-		part, err := writer.CreateFormFile(req.files[i].Field, req.files[i].Name)
+	if err := json.NewEncoder(&mapBuf).Encode(req.Map()); err != nil {
+		return errors.Wrap(err, "encode map")
+	}
+	if err := writer.WriteField("map", mapBuf.String()); err != nil {
+		return errors.Wrap(err, "write map field")
+	}
+	for i, file := range req.files {
+		// use i as field name to match .Map() files specification.
+		part, err := writer.CreateFormFile(strconv.Itoa(i), file.Name)
 		if err != nil {
 			return errors.Wrap(err, "create form file")
 		}
-		if _, err := io.Copy(part, req.files[i].R); err != nil {
+		if _, err := io.Copy(part, file.R); err != nil {
 			return errors.Wrap(err, "preparing file")
 		}
 	}
 	if err := writer.Close(); err != nil {
 		return errors.Wrap(err, "close writer")
 	}
-	c.logf(">> variables: %s", variablesBuf.String())
+	c.logf(">> operations: %s", operationsBuf.String())
 	c.logf(">> files: %d", len(req.files))
 	c.logf(">> query: %s", req.q)
 	gr := &graphResponse{
@@ -314,6 +315,35 @@ func (req *Request) File(fieldname, filename string, r io.Reader) {
 		Name:  filename,
 		R:     r,
 	})
+}
+
+// Operations gets the query and variables to be provided as the operations field
+// in a multipart request, as specified in
+// https://github.com/jaydenseric/graphql-multipart-request-spec
+func (req *Request) Operations() map[string]interface{} {
+	ops := map[string]interface{}{
+		"query":     req.Query(),
+		"variables": map[string]interface{}{},
+	}
+	if len(req.Vars()) > 0 {
+		ops["variables"] = req.Vars()
+	}
+	// add files to variables map.
+	for _, file := range req.Files() {
+		ops["variables"].(map[string]interface{})[file.Field] = nil
+	}
+	return ops
+}
+
+// Map gets the files encoded as the map part in a multipart request, as specified in
+// https://github.com/jaydenseric/graphql-multipart-request-spec
+func (req *Request) Map() map[string][]string {
+	m := map[string][]string{}
+	for i, file := range req.Files() {
+		k := strconv.Itoa(i)
+		m[k] = append(m[k], fmt.Sprintf("variables.%s", file.Field))
+	}
+	return m
 }
 
 // File represents a file to upload.
